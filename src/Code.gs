@@ -1,0 +1,619 @@
+/**
+ * 車の試乗予約システム（Google Apps Script + Google スプレッドシート）
+ *
+ * スプレッドシートに紐づけた（コンテナバインド）スクリプトとして動作し、
+ * 予約画面（GitHub Pages の docs/index.html）向けの JSON API を提供します。
+ *   - 「設定」シート : 試乗時間・受付時間・定休日・規約などを管理
+ *   - 「試乗車」シート: 試乗車の一覧（複数台）
+ *   - 「予約」シート : 予約データ（1枠につき1名）
+ *   - 「予約一覧」シート: 日付ごとの「時間枠 × 試乗車」の一覧（予約シートから自動作成）
+ */
+
+const SHEET = {
+  SETTINGS: '設定',
+  CARS: '試乗車',
+  BOOKINGS: '予約',
+  LIST: '予約一覧',
+};
+
+const STATUS_BOOKED = '予約';
+const STATUS_CANCELED = 'キャンセル';
+
+const DEFAULT_TERMS = [
+  '【試乗に関する規約】',
+  '1. 試乗には有効な運転免許証が必要です。当日受付にてご提示ください。',
+  '2. 試乗コースはスタッフが指定します。スタッフが同乗します。',
+  '3. 飲酒・体調不良時の試乗はお断りします。',
+  '4. 交通法規を遵守し、安全運転をお願いします。',
+  '5. お客様の故意・重大な過失による事故の損害は、お客様のご負担となる場合があります。',
+  '6. 予約時刻に15分以上遅れた場合、予約を取り消すことがあります。',
+  '7. ご入力いただいた個人情報は、試乗のご案内およびご連絡のみに利用します。',
+].join('\n');
+
+/** 設定項目の定義（label がシート上の項目名） */
+const SETTING_DEFS = [
+  { key: 'storeName',    label: '店舗名',            value: '○○モータース',  note: '画面上部に表示する名称' },
+  { key: 'storePhone',   label: '店舗電話番号',      value: '00-0000-0000',   note: '予約完了画面に表示（変更・キャンセル連絡先）' },
+  { key: 'duration',     label: '試乗時間（分）',    value: '40',             note: '1回の試乗時間' },
+  { key: 'interval',     label: 'インターバル（分）', value: '10',            note: '枠と枠の間の準備時間（0も可）' },
+  { key: 'openTime',     label: '受付開始時刻',      value: '10:00',          note: '最初の枠の開始時刻（HH:MM）' },
+  { key: 'closeTime',    label: '受付終了時刻',      value: '18:00',          note: '最終枠がこの時刻までに終わるよう枠を作成（HH:MM）' },
+  { key: 'dates',        label: '予約可能日',        value: '',               note: 'YYYYMMDD 形式。複数はカンマ区切りまたは改行 例: 20261101,20261102（過去の日付は自動で非表示）' },
+  { key: 'cutoff',       label: '締切（分前）',      value: '60',             note: '開始時刻の何分前まで予約を受け付けるか' },
+  { key: 'closedDays',   label: '定休日（曜日）',    value: '水',             note: 'カンマ区切り 例: 水,木（空欄なら定休日なし）' },
+  { key: 'holidays',     label: '休業日',            value: '',               note: 'カンマ区切り 例: 20261231,20270101' },
+  { key: 'notifyEmail',  label: '通知先メール',      value: '',               note: '新規予約の通知先（空欄なら通知しない）' },
+  { key: 'terms',        label: '利用規約',          value: DEFAULT_TERMS,    note: '予約画面に表示する規約' },
+];
+
+const CAR_HEADERS = ['車両ID', '車名', '説明', '画像URL', '受付中'];
+const SAMPLE_CARS = [
+  ['CAR01', 'サンプルセダン', 'ハイブリッド / 5人乗り', '', true],
+  ['CAR02', 'サンプルSUV', '4WD / 7人乗り', '', true],
+  ['CAR03', 'サンプルコンパクト', 'ガソリン / 5人乗り', '', true],
+];
+
+const BOOKING_HEADERS = ['予約ID', '受付日時', '試乗日', '開始', '終了', '車両ID', '車名', '氏名', '連絡先', '規約同意', 'ステータス', 'メモ'];
+const COL = { id: 0, createdAt: 1, date: 2, start: 3, end: 4, carId: 5, carName: 6, name: 7, contact: 8, agreed: 9, status: 10, memo: 11 };
+
+const WEEKDAYS = ['日', '月', '火', '水', '木', '金', '土'];
+
+// ---------------------------------------------------------------------------
+// Web アプリ
+// ---------------------------------------------------------------------------
+// 予約画面は GitHub Pages（docs/index.html）に置き、ここは JSON API のみ提供する。
+// script.google.com を画面として直接開くと、複数の Google アカウントでログイン中の
+// ブラウザ（特に iPhone）で「ファイルを開くことができません」となるため。
+//
+//   GET  ?action=init                       … 店舗情報・試乗車・予約可能日
+//   GET  ?action=slots&carId=..&date=..     … 指定した車・日付の空き状況
+//   POST {"action":"book","form":{...}}     … 予約登録（Content-Type: text/plain）
+
+function doGet(e) {
+  const p = (e && e.parameter) || {};
+  return api_(p.action, p);
+}
+
+function doPost(e) {
+  let body = {};
+  try {
+    body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+  } catch (err) {
+    // 不正な JSON は下の「不明なリクエスト」として扱う
+  }
+  return api_(body.action, body);
+}
+
+function api_(action, p) {
+  let result;
+  try {
+    let data;
+    if (action === 'init') data = getInitData();
+    else if (action === 'slots') data = getSlots(String(p.carId || ''), String(p.date || ''));
+    else if (action === 'book') data = book(p.form);
+    else throw new Error('不明なリクエストです。');
+    result = { ok: true, data: data };
+  } catch (err) {
+    result = { ok: false, error: (err && err.message) || String(err) };
+  }
+  return ContentService.createTextOutput(JSON.stringify(result))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/** 画面の初期表示に必要なデータ */
+function getInitData() {
+  const s = getSettings_();
+  return {
+    storeName: s.storeName,
+    storePhone: s.storePhone,
+    duration: s.duration,
+    terms: s.terms,
+    cars: getActiveCars_().map(function (c) {
+      return { id: c.id, name: c.name, description: c.description, imageUrl: c.imageUrl };
+    }),
+    dates: getAvailableDates_(s, nowInfo_()),
+  };
+}
+
+/** 指定した車・日付の枠と空き状況（個人情報は返さない） */
+function getSlots(carId, date) {
+  const s = getSettings_();
+  const now = nowInfo_();
+  const car = findActiveCar_(carId);
+  if (!car) throw new Error('選択された試乗車は現在受付していません。');
+  if (!isBookableDate_(s, now, date)) throw new Error('選択された日付は予約できません。');
+
+  const booked = getActiveBookings_().filter(function (b) {
+    return b.carId === carId && b.date === date;
+  });
+  return buildSlots_(s).map(function (slot) {
+    return {
+      start: slot.start,
+      end: slot.end,
+      available: !isPast_(s, now, date, slot.start) && !hasOverlap_(booked, slot),
+    };
+  });
+}
+
+/** 予約の登録 */
+function book(form) {
+  form = form || {};
+  const name = cleanText_(form.name, 50);
+  const contact = toHalfWidth_(cleanText_(form.contact, 100));
+  const carId = String(form.carId || '');
+  const date = String(form.date || '');
+  const start = String(form.start || '');
+
+  if (!name) throw new Error('氏名を入力してください。');
+  if (!isValidContact_(contact)) throw new Error('連絡先には電話番号またはメールアドレスを入力してください。');
+  if (form.agreed !== true) throw new Error('規約への同意が必要です。');
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) throw new Error('混み合っています。時間をおいて再度お試しください。');
+  try {
+    const s = getSettings_();
+    const now = nowInfo_();
+    const car = findActiveCar_(carId);
+    if (!car) throw new Error('選択された試乗車は現在受付していません。');
+    if (!isBookableDate_(s, now, date)) throw new Error('選択された日付は予約できません。');
+
+    const slot = buildSlots_(s).filter(function (x) { return x.start === start; })[0];
+    if (!slot) throw new Error('選択された時間枠は存在しません。');
+    if (isPast_(s, now, date, slot.start)) throw new Error('選択された時間枠は受付を締め切りました。');
+
+    const booked = getActiveBookings_().filter(function (b) {
+      return b.carId === carId && b.date === date;
+    });
+    if (hasOverlap_(booked, slot)) {
+      throw new Error('申し訳ありません。この枠は先に予約が入りました。別の枠をお選びください。');
+    }
+
+    const id = 'TD' + date.replace(/-/g, '') + '-' + Utilities.getUuid().slice(0, 4).toUpperCase();
+    const row = [];
+    row[COL.id] = id;
+    row[COL.createdAt] = now.dateTime;
+    row[COL.date] = date;
+    row[COL.start] = slot.start;
+    row[COL.end] = slot.end;
+    row[COL.carId] = car.id;
+    row[COL.carName] = car.name;
+    row[COL.name] = name;
+    row[COL.contact] = contact;
+    row[COL.agreed] = '同意済';
+    row[COL.status] = STATUS_BOOKED;
+    row[COL.memo] = '';
+
+    const sheet = getSheet_(SHEET.BOOKINGS);
+    const rowIndex = sheet.getLastRow() + 1;
+    if (rowIndex > sheet.getMaxRows()) sheet.insertRowsAfter(sheet.getMaxRows(), 100);
+    const range = sheet.getRange(rowIndex, 1, 1, BOOKING_HEADERS.length);
+    range.setNumberFormat('@').setValues([row.map(escapeFormula_)]);
+    SpreadsheetApp.flush();
+    try {
+      refreshBookingList();
+    } catch (e) {
+      // 一覧の更新に失敗しても予約自体は成立させる
+      console.error('list refresh failed: ' + e);
+    }
+
+    const result = {
+      id: id,
+      carName: car.name,
+      date: date,
+      dateLabel: dateLabel_(date),
+      start: slot.start,
+      end: slot.end,
+      name: name,
+      contact: contact,
+      storeName: s.storeName,
+      storePhone: s.storePhone,
+    };
+    sendMails_(s, result);
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// スプレッドシート
+// ---------------------------------------------------------------------------
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('試乗予約')
+    .addItem('初期設定（シート作成）', 'setup')
+    .addItem('予約一覧を更新', 'refreshBookingList')
+    .addToUi();
+}
+
+/** 予約・設定・試乗車シートを手で編集したら予約一覧を作り直す（シンプルトリガー） */
+function onEdit(e) {
+  const name = e && e.range ? e.range.getSheet().getName() : '';
+  if ([SHEET.BOOKINGS, SHEET.SETTINGS, SHEET.CARS].indexOf(name) !== -1) refreshBookingList();
+}
+
+/** 必要なシートを作成し、初期値を入れる（既存データは上書きしない） */
+function setup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  let sheet = ss.getSheetByName(SHEET.SETTINGS);
+  if (!sheet) {
+    sheet = ss.insertSheet(SHEET.SETTINGS);
+    const rows = [['項目', '値', '説明']].concat(SETTING_DEFS.map(function (d) {
+      return [d.label, d.value, d.note];
+    }));
+    sheet.getRange(1, 1, rows.length, 3).setNumberFormat('@').setValues(rows);
+    sheet.getRange(1, 1, 1, 3).setFontWeight('bold').setBackground('#e8eaf6');
+    sheet.setColumnWidth(1, 160).setColumnWidth(2, 360).setColumnWidth(3, 420);
+    sheet.getRange(2, 2, rows.length - 1, 1).setWrap(true).setVerticalAlignment('top');
+    sheet.setFrozenRows(1);
+  } else {
+    // 後から追加された設定項目を補う
+    const labels = sheet.getRange(1, 1, Math.max(sheet.getLastRow(), 1), 1).getDisplayValues()
+      .map(function (r) { return r[0]; });
+    SETTING_DEFS.forEach(function (d) {
+      if (labels.indexOf(d.label) !== -1) return;
+      // 旧項目「予約可能日数」は「予約可能日」に置き換える
+      const old = d.key === 'dates' ? labels.indexOf('予約可能日数') : -1;
+      const row = old !== -1 ? old + 1 : sheet.getLastRow() + 1;
+      sheet.getRange(row, 1, 1, 3).setNumberFormat('@').setValues([[d.label, d.value, d.note]]);
+    });
+  }
+
+  sheet = ss.getSheetByName(SHEET.CARS);
+  if (!sheet) {
+    sheet = ss.insertSheet(SHEET.CARS);
+    sheet.getRange(1, 1, 1, CAR_HEADERS.length).setValues([CAR_HEADERS])
+      .setFontWeight('bold').setBackground('#e8eaf6');
+    sheet.getRange(2, 1, SAMPLE_CARS.length, CAR_HEADERS.length).setValues(SAMPLE_CARS);
+    sheet.getRange(2, 5, 200, 1).insertCheckboxes();
+    sheet.setColumnWidth(2, 200).setColumnWidth(3, 260).setColumnWidth(4, 260);
+    sheet.setFrozenRows(1);
+  }
+
+  sheet = ss.getSheetByName(SHEET.BOOKINGS);
+  if (!sheet) {
+    sheet = ss.insertSheet(SHEET.BOOKINGS);
+    sheet.getRange(1, 1, 1, BOOKING_HEADERS.length).setValues([BOOKING_HEADERS])
+      .setFontWeight('bold').setBackground('#e8eaf6');
+    sheet.getRange(2, 1, sheet.getMaxRows() - 1, BOOKING_HEADERS.length).setNumberFormat('@');
+    const rule = SpreadsheetApp.newDataValidation()
+      .requireValueInList([STATUS_BOOKED, STATUS_CANCELED], true).build();
+    sheet.getRange(2, COL.status + 1, sheet.getMaxRows() - 1, 1).setDataValidation(rule);
+    sheet.setFrozenRows(1);
+  }
+
+  const first = ss.getSheetByName('シート1') || ss.getSheetByName('Sheet1');
+  if (first && first.getLastRow() === 0 && ss.getSheets().length > 1) ss.deleteSheet(first);
+
+  refreshBookingList();
+  sheet = ss.getSheetByName(SHEET.LIST);
+  if (sheet.getIndex() !== ss.getNumSheets()) {
+    ss.setActiveSheet(sheet);
+    ss.moveActiveSheet(ss.getNumSheets());
+  }
+}
+
+/**
+ * 「予約一覧」シートを作り直す。今日以降の予約可能日（と予約が入っている日）ごとに、
+ * 行 = 時間枠、列 = 試乗車 の表を並べ、予約が入っている枠には氏名と連絡先を表示する。
+ */
+function refreshBookingList() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const s = getSettings_();
+  const now = nowInfo_();
+  const bookings = getActiveBookings_().filter(function (b) { return b.date >= now.date; });
+
+  const cars = getActiveCars_().map(function (c) { return { id: c.id, name: c.name }; });
+  bookings.forEach(function (b) {
+    // 受付を停止した車でも、予約が残っていれば列を出す
+    if (!cars.some(function (c) { return c.id === b.carId; })) cars.push({ id: b.carId, name: b.carName || b.carId });
+  });
+  const dates = s.dates
+    .filter(function (d) { return d >= now.date && isOpenDay_(s, d); })
+    .concat(bookings.map(function (b) { return b.date; }))
+    .filter(function (x, i, a) { return a.indexOf(x) === i; })
+    .sort();
+  const slots = buildSlots_(s);
+
+  const width = Math.max(cars.length + 1, 2);
+  const rows = [];
+  const bg = [];
+  const colors = [];
+  const weights = [];
+  function push(values, background, color, weight) {
+    while (values.length < width) values.push('');
+    rows.push(values);
+    bg.push(values.map(function (v, i) { return typeof background === 'function' ? background(i) : background; }));
+    colors.push(values.map(function (v, i) { return typeof color === 'function' ? color(i) : color; }));
+    weights.push(values.map(function () { return weight; }));
+  }
+
+  push(['予約一覧（最終更新: ' + now.dateTime + '）'], '#ffffff', '#000000', 'bold');
+  push(['※「予約」シートから自動で作成されます。このシートは直接編集しないでください。'], '#ffffff', '#6b7280', 'normal');
+
+  dates.forEach(function (date) {
+    const dayBookings = bookings.filter(function (b) { return b.date === date; });
+    push([''], '#ffffff', '#000000', 'normal');
+    push([dateLabel_(date) + '（予約 ' + dayBookings.length + '件）'].concat(cars.map(function (c) { return c.name; })),
+      '#e8eaf6', '#000000', 'bold');
+    slots.forEach(function (slot) {
+      const cells = cars.map(function (c) {
+        return dayBookings
+          .filter(function (b) { return b.carId === c.id && hasOverlap_([b], slot); })
+          .map(function (b) { return b.name + (b.contact ? '\n' + b.contact : ''); })
+          .join('\n');
+      });
+      push([slot.start + '〜' + slot.end].concat(cells.map(function (v) { return v || '空き'; })),
+        function (i) { return i > 0 && cells[i - 1] ? '#fde7e9' : '#ffffff'; },
+        function (i) { return i > 0 && !cells[i - 1] ? '#9aa0a6' : '#000000'; },
+        'normal');
+    });
+  });
+  if (!dates.length) push(['表示できる日付がありません（設定シートの「予約可能日」を確認してください）'], '#ffffff', '#000000', 'normal');
+
+  let sheet = ss.getSheetByName(SHEET.LIST);
+  if (!sheet) sheet = ss.insertSheet(SHEET.LIST, ss.getNumSheets());
+  sheet.clear();
+  const range = sheet.getRange(1, 1, rows.length, width);
+  range.setNumberFormat('@').setValues(rows.map(function (r) { return r.map(escapeFormula_); })).setBackgrounds(bg).setFontColors(colors).setFontWeights(weights)
+    .setWrap(true).setVerticalAlignment('top');
+  sheet.setColumnWidth(1, 170);
+  if (width > 1) sheet.setColumnWidths(2, width - 1, 170);
+}
+
+function getSheet_(name) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+  if (!sheet) throw new Error('「' + name + '」シートがありません。メニュー「試乗予約 > 初期設定」を実行してください。');
+  return sheet;
+}
+
+function getSettings_() {
+  const values = getSheet_(SHEET.SETTINGS).getDataRange().getDisplayValues();
+  const byLabel = {};
+  values.slice(1).forEach(function (r) { byLabel[String(r[0]).trim()] = r[1]; });
+
+  const raw = {};
+  SETTING_DEFS.forEach(function (d) {
+    raw[d.key] = byLabel.hasOwnProperty(d.label) ? String(byLabel[d.label]) : d.value;
+  });
+  return normalizeSettings_(raw);
+}
+
+function getActiveCars_() {
+  const values = getSheet_(SHEET.CARS).getDataRange().getValues();
+  return values.slice(1)
+    .filter(function (r) { return String(r[0]).trim() && String(r[1]).trim() && isTruthy_(r[4]); })
+    .map(function (r) {
+      return {
+        id: String(r[0]).trim(),
+        name: String(r[1]).trim(),
+        description: String(r[2] || '').trim(),
+        imageUrl: String(r[3] || '').trim(),
+      };
+    });
+}
+
+function findActiveCar_(carId) {
+  return getActiveCars_().filter(function (c) { return c.id === carId; })[0] || null;
+}
+
+/** キャンセル以外の予約（手入力の行も考慮して正規化） */
+function getActiveBookings_() {
+  const sheet = getSheet_(SHEET.BOOKINGS);
+  if (sheet.getLastRow() < 2) return [];
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, BOOKING_HEADERS.length).getDisplayValues();
+  return values
+    .filter(function (r) { return String(r[COL.status]).trim() !== STATUS_CANCELED; })
+    .map(function (r) {
+      return {
+        id: String(r[COL.id]).trim(),
+        carId: String(r[COL.carId]).trim(),
+        carName: String(r[COL.carName]).trim(),
+        name: String(r[COL.name]).trim(),
+        contact: String(r[COL.contact]).trim(),
+        date: normalizeDate_(r[COL.date]),
+        start: normalizeTime_(r[COL.start]),
+        end: normalizeTime_(r[COL.end]),
+      };
+    })
+    .filter(function (b) { return b.carId && b.date && b.start && b.end; });
+}
+
+// ---------------------------------------------------------------------------
+// 予約枠の計算（純粋関数）
+// ---------------------------------------------------------------------------
+
+function normalizeSettings_(raw) {
+  const s = {
+    storeName: raw.storeName || '試乗予約',
+    storePhone: raw.storePhone || '',
+    duration: toPositiveInt_(raw.duration, 40),
+    interval: toNonNegativeInt_(raw.interval, 0),
+    openTime: normalizeTime_(raw.openTime) || '10:00',
+    closeTime: normalizeTime_(raw.closeTime) || '18:00',
+    dates: splitList_(raw.dates).map(normalizeDate_).filter(Boolean)
+      .filter(function (x, i, a) { return a.indexOf(x) === i; }).sort(),
+    cutoff: toNonNegativeInt_(raw.cutoff, 0),
+    closedDays: splitList_(raw.closedDays).map(function (x) { return x.charAt(0); })
+      .filter(function (x) { return WEEKDAYS.indexOf(x) !== -1; }),
+    holidays: splitList_(raw.holidays).map(normalizeDate_).filter(Boolean),
+    notifyEmail: String(raw.notifyEmail || '').trim(),
+    terms: raw.terms || '',
+  };
+  return s;
+}
+
+function buildSlots_(s) {
+  const slots = [];
+  const open = toMinutes_(s.openTime);
+  const close = toMinutes_(s.closeTime);
+  const step = s.duration + s.interval;
+  for (let t = open; t + s.duration <= close; t += step) {
+    slots.push({ start: fromMinutes_(t), end: fromMinutes_(t + s.duration) });
+  }
+  return slots;
+}
+
+function hasOverlap_(bookings, slot) {
+  const a1 = toMinutes_(slot.start);
+  const a2 = toMinutes_(slot.end);
+  return bookings.some(function (b) {
+    return toMinutes_(b.start) < a2 && a1 < toMinutes_(b.end);
+  });
+}
+
+function getAvailableDates_(s, now) {
+  return s.dates
+    .filter(function (date) {
+      if (date < now.date || !isOpenDay_(s, date)) return false;
+      // 当日で受付可能な枠が残っていない場合は表示しない
+      return date > now.date || buildSlots_(s).some(function (x) { return !isPast_(s, now, date, x.start); });
+    })
+    .map(function (date) {
+      return { date: date, label: dateLabel_(date), weekday: weekday_(date) };
+    });
+}
+
+function isBookableDate_(s, now, date) {
+  return s.dates.indexOf(date) !== -1 && date >= now.date && isOpenDay_(s, date);
+}
+
+function isOpenDay_(s, date) {
+  return s.closedDays.indexOf(WEEKDAYS[weekday_(date)]) === -1 && s.holidays.indexOf(date) === -1;
+}
+
+function isPast_(s, now, date, start) {
+  if (date > now.date) return false;
+  if (date < now.date) return true;
+  return toMinutes_(start) - s.cutoff < now.minutes;
+}
+
+// ---------------------------------------------------------------------------
+// メール
+// ---------------------------------------------------------------------------
+
+function sendMails_(s, r) {
+  const body = [
+    '予約ID: ' + r.id,
+    '試乗車: ' + r.carName,
+    '日時　: ' + r.dateLabel + ' ' + r.start + '〜' + r.end,
+    '氏名　: ' + r.name,
+    '連絡先: ' + r.contact,
+  ].join('\n');
+
+  try {
+    if (s.notifyEmail) {
+      MailApp.sendEmail(s.notifyEmail, '【試乗予約】' + r.dateLabel + ' ' + r.start + ' ' + r.carName, '新しい試乗予約が入りました。\n\n' + body);
+    }
+    if (isEmail_(r.contact)) {
+      MailApp.sendEmail(r.contact, '【' + s.storeName + '】試乗予約を受け付けました',
+        r.name + ' 様\n\nこの度は試乗のご予約ありがとうございます。\n以下の内容で受け付けました。\n\n' + body +
+        '\n\n当日は運転免許証をお持ちください。\n変更・キャンセルは下記までご連絡ください。\n' +
+        s.storeName + (s.storePhone ? ' TEL: ' + s.storePhone : ''));
+    }
+  } catch (e) {
+    // メール送信に失敗しても予約自体は成立させる
+    console.error('mail failed: ' + e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ユーティリティ
+// ---------------------------------------------------------------------------
+
+function nowInfo_() {
+  const tz = Session.getScriptTimeZone() || 'Asia/Tokyo';
+  const d = new Date();
+  const hm = Utilities.formatDate(d, tz, 'HH:mm');
+  return {
+    date: Utilities.formatDate(d, tz, 'yyyy-MM-dd'),
+    minutes: toMinutes_(hm),
+    dateTime: Utilities.formatDate(d, tz, 'yyyy-MM-dd HH:mm:ss'),
+  };
+}
+
+function toMinutes_(hm) {
+  const m = /^(\d{1,2}):(\d{2})/.exec(String(hm));
+  return m ? Number(m[1]) * 60 + Number(m[2]) : NaN;
+}
+
+function fromMinutes_(n) {
+  return ('0' + Math.floor(n / 60)).slice(-2) + ':' + ('0' + (n % 60)).slice(-2);
+}
+
+function normalizeTime_(v) {
+  const m = /(\d{1,2})[:：](\d{2})/.exec(String(v || ''));
+  return m ? fromMinutes_(Number(m[1]) * 60 + Number(m[2])) : '';
+}
+
+/** YYYYMMDD / YYYY-MM-DD / YYYY/MM/DD / YYYY年M月D日 を YYYY-MM-DD に揃える（存在しない日付は空文字） */
+function normalizeDate_(v) {
+  const str = String(v || '').trim();
+  const m = /^(\d{4})(\d{2})(\d{2})$/.exec(str) || /(\d{4})[-\/年](\d{1,2})[-\/月](\d{1,2})/.exec(str);
+  if (!m) return '';
+  const ymd = m[1] + '-' + ('0' + m[2]).slice(-2) + '-' + ('0' + m[3]).slice(-2);
+  const d = parseYmd_(ymd);
+  return d.getUTCMonth() + 1 === Number(m[2]) && d.getUTCDate() === Number(m[3]) ? ymd : '';
+}
+
+function parseYmd_(ymd) {
+  const p = ymd.split('-').map(Number);
+  return new Date(Date.UTC(p[0], p[1] - 1, p[2], 12));
+}
+
+function weekday_(ymd) {
+  return parseYmd_(ymd).getUTCDay();
+}
+
+function dateLabel_(ymd) {
+  const p = ymd.split('-').map(Number);
+  return p[1] + '月' + p[2] + '日(' + WEEKDAYS[weekday_(ymd)] + ')';
+}
+
+function splitList_(v) {
+  return String(v || '').split(/[,、，\s]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+}
+
+function toPositiveInt_(v, def) {
+  const n = parseInt(String(v).replace(/[^\d]/g, ''), 10);
+  return n > 0 ? n : def;
+}
+
+function toNonNegativeInt_(v, def) {
+  const n = parseInt(String(v).replace(/[^\d]/g, ''), 10);
+  return n >= 0 ? n : def;
+}
+
+function isTruthy_(v) {
+  return v === true || /^(true|yes|1|○|◯|はい|受付|有効)$/i.test(String(v).trim());
+}
+
+function cleanText_(v, max) {
+  return String(v || '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, max);
+}
+
+/** 全角英数字・記号を半角に変換（iPhone の全角入力対策） */
+function toHalfWidth_(v) {
+  return String(v).replace(/[！-～]/g, function (c) {
+    return String.fromCharCode(c.charCodeAt(0) - 0xFEE0);
+  }).replace(/[ー－―]/g, '-').replace(/　/g, ' ');
+}
+
+function isEmail_(v) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+}
+
+function isValidContact_(v) {
+  if (!v) return false;
+  if (isEmail_(v)) return true;
+  const digits = v.replace(/[\s\-()（）ー－]/g, '').replace(/^\+81/, '0');
+  return /^0\d{9,10}$/.test(digits);
+}
+
+/** スプレッドシートの数式として解釈されないようにする */
+function escapeFormula_(v) {
+  const s = String(v);
+  return /^[=+\-@]/.test(s) ? "'" + s : s;
+}
