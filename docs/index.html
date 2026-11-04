@@ -62,6 +62,29 @@
     }
     .car b { display: block; font-size: 16px; }
     .car small { color: var(--muted); font-size: 13px; }
+    .car .photos { display: block; color: var(--primary); font-size: 12px; margin-top: 2px; }
+
+    .gallery { position: relative; margin-top: 8px; border-radius: 12px; overflow: hidden; background: #f0f1f4; }
+    .gallery-track {
+      display: flex; overflow-x: auto; scroll-snap-type: x mandatory;
+      -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    }
+    .gallery-track::-webkit-scrollbar { display: none; }
+    .gallery-track img {
+      flex: 0 0 100%; width: 100%; aspect-ratio: 16 / 10; object-fit: contain; scroll-snap-align: center;
+    }
+    .gallery .nav {
+      position: absolute; top: 50%; transform: translateY(-50%);
+      width: 36px; height: 36px; border: none; border-radius: 50%; padding: 0;
+      background: rgba(255,255,255,.85); color: var(--text); font-size: 22px; line-height: 36px;
+      box-shadow: 0 1px 3px rgba(0,0,0,.2); cursor: pointer;
+    }
+    .gallery .prev { left: 8px; }
+    .gallery .next { right: 8px; }
+    .gallery .count {
+      position: absolute; right: 8px; bottom: 8px; padding: 2px 8px; border-radius: 999px;
+      background: rgba(0,0,0,.55); color: #fff; font-size: 12px;
+    }
 
     .dates {
       display: flex; gap: 8px; overflow-x: auto; padding-bottom: 6px;
@@ -321,12 +344,34 @@
         return;
       }
       $('cars').innerHTML = cars.map(function (c) {
-        var img = c.imageUrl
-          ? '<img src="' + esc(c.imageUrl) + '" alt="" loading="lazy">'
+        var imgs = carImages(c);
+        var sel = c.id === state.carId;
+        var thumb = imgs.length
+          ? '<img src="' + esc(imgs[0]) + '" alt="" loading="lazy">'
           : '<span class="ph">🚗</span>';
-        return '<button type="button" class="car' + (c.id === state.carId ? ' sel' : '') + '" data-id="' + esc(c.id) + '">' +
-          img + '<span><b>' + esc(c.name) + '</b><small>' + esc(c.description) + '</small></span></button>';
+        var photos = imgs.length > 1 ? '<span class="photos">📷 写真 ' + imgs.length + '枚' + (sel ? '' : '（選択すると大きく表示）') + '</span>' : '';
+        return '<div class="car-item" data-id="' + esc(c.id) + '">' +
+          '<button type="button" class="car' + (sel ? ' sel' : '') + '" data-id="' + esc(c.id) + '">' +
+          thumb + '<span><b>' + esc(c.name) + '</b><small>' + esc(c.description) + '</small>' + photos + '</span></button>' +
+          (sel && imgs.length ? galleryHtml(c, imgs) : '') + '</div>';
       }).join('');
+    }
+
+    // imageUrls が無い旧版の API にも対応する
+    function carImages(c) {
+      return c.imageUrls || (c.imageUrl ? [c.imageUrl] : []);
+    }
+
+    function galleryHtml(c, imgs) {
+      var html = '<div class="gallery"><div class="gallery-track">' + imgs.map(function (u, i) {
+        return '<img src="' + esc(u) + '" alt="' + esc(c.name) + ' 写真' + (i + 1) + '"' + (i ? ' loading="lazy"' : '') + '>';
+      }).join('') + '</div>';
+      if (imgs.length > 1) {
+        html += '<button type="button" class="nav prev" aria-label="前の写真">‹</button>' +
+          '<button type="button" class="nav next" aria-label="次の写真">›</button>' +
+          '<span class="count">1 / ' + imgs.length + '</span>';
+      }
+      return html + '</div>';
     }
 
     function renderDates() {
@@ -387,6 +432,12 @@
 
     // --- イベント ---
     $('cars').addEventListener('click', function (e) {
+      var nav = e.target.closest('.nav');
+      if (nav) {
+        var track = nav.parentNode.querySelector('.gallery-track');
+        track.scrollBy({ left: (nav.classList.contains('next') ? 1 : -1) * track.clientWidth, behavior: 'smooth' });
+        return;
+      }
       var b = e.target.closest('.car');
       if (!b) return;
       state.carId = b.getAttribute('data-id');
@@ -395,8 +446,22 @@
       renderDates();
       setStep(2);
       if (state.date) { loadSlots(); setStep(3); }
-      scrollToCard(state.date ? 'slotCard' : 'dateCard');
+      if (carImages(carById(state.carId)).length) {
+        // 写真を見てもらえるよう、選んだ車を画面上部に表示する
+        var item = $('cars').querySelector('.car-item[data-id="' + state.carId.replace(/["\\]/g, '\\$&') + '"]');
+        setTimeout(function () { item.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 50);
+      } else {
+        scrollToCard(state.date ? 'slotCard' : 'dateCard');
+      }
     });
+
+    // 写真の「n / 枚数」表示を、スワイプ位置に合わせて更新（scroll はバブリングしないので capture で受ける）
+    $('cars').addEventListener('scroll', function (e) {
+      var track = e.target;
+      if (!track.classList || !track.classList.contains('gallery-track')) return;
+      var count = track.parentNode.querySelector('.count');
+      if (count) count.textContent = (Math.round(track.scrollLeft / track.clientWidth) + 1) + ' / ' + track.children.length;
+    }, true);
 
     $('dates').addEventListener('click', function (e) {
       var b = e.target.closest('.date');
@@ -451,7 +516,8 @@
           ['連絡先', r.contact],
         ]);
         $('doneNotice').textContent = '当日は運転免許証をお持ちのうえ、予約時刻の5分前までにお越しください。' +
-          '予約内容の変更・キャンセルは試乗受付まで直接お越しください。この画面のスクリーンショットを保存しておくと便利です。';
+          '予約内容の変更・キャンセルは ' + r.storeName + (r.storePhone ? '（TEL: ' + r.storePhone + '）' : '') +
+          ' までご連絡ください。この画面のスクリーンショットを保存しておくと便利です。';
         window.scrollTo(0, 0);
       });
     });
