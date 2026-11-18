@@ -378,7 +378,7 @@
         state.init = data;
         $('initLoading').hidden = true;
         $('storeName').textContent = data.storeName;
-        $('subTitle').textContent = 'オンライン試乗予約（1回 約' + data.duration + '分）';
+        $('subTitle').textContent = 'オンライン試乗予約（1枠 約' + data.duration + '分）';
         document.title = data.storeName + ' 試乗予約';
         $('terms').textContent = data.terms;
         renderCars();
