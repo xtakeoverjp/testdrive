@@ -457,7 +457,7 @@
       var slots = state.slots;
       var any = slots.some(function (s) { return s.available; });
       if (!slots.length || !any) {
-        $('slots').innerHTML = '<div class="empty" style="grid-column:1/-1">この日は空き枠がありません。別の日付をお選びください。</div>';
+        $('slots').innerHTML = '<div class="empty" style="grid-column:1/-1">予約可能な空き枠がありません。</div>';
         return;
       }
       $('slots').innerHTML = slots.map(function (s) {
